@@ -1,3 +1,27 @@
+# tailor.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Core 3-step LLM pipeline that powers the resume tailoring process.
+#
+# Pipeline overview:
+#   Step 1 — analyze_jd()    : Extract structured intelligence from the JD
+#                               (role type, skills, ATS keywords, company tone)
+#   Step 2 — tailor_resume() : Rewrite resume sections to mirror the JD
+#                               (summary, bullet points, project ordering)
+#   Step 3 — ats_score()     : Simulate an ATS scan and score the tailored resume
+#                               (keyword coverage, skill alignment, experience fit)
+#
+# Why Groq + Llama 3.3?
+#   Groq's inference hardware (LPUs) delivers very low latency — all 3 steps
+#   complete in under 30 seconds. Llama 3.3 70B handles structured JSON output
+#   reliably enough for production use without a separate output parser library.
+#
+# Why 3 separate prompts instead of one big prompt?
+#   Chaining focused prompts produces more accurate, auditable output. Each step
+#   builds on the previous one: the JD analysis result is passed directly into
+#   the resume tailoring prompt, which is then passed into the ATS scorer.
+#   A single monolithic prompt loses this structured context flow.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import json
 import os
 import re
@@ -5,17 +29,30 @@ import time
 from groq import Groq, RateLimitError, APIConnectionError, APIStatusError
 from resume_data import resume
 
+# Groq client — API key is injected from Streamlit secrets into os.environ
+# by app.py before this module is imported, so this line works in both
+# local dev (via secrets.toml) and Streamlit Cloud deployment.
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+# llama-3.3-70b-versatile balances quality and speed for structured JSON tasks.
 MODEL = "llama-3.3-70b-versatile"
 
 
 class PipelineError(Exception):
-    """User-facing error with a clean message."""
+    """
+    User-facing error raised at any pipeline step.
+    Messages are intentionally clean (no stack traces) so they can be shown
+    directly in the Streamlit UI via st.error().
+    """
     pass
 
 
 def _call(messages: list, max_tokens: int) -> str:
-    """Single API call with one retry on rate limit."""
+    """
+    Wraps a single Groq API call with one automatic retry on rate limit.
+    Converts all Groq-specific exceptions into PipelineError so the caller
+    only needs to catch one exception type.
+    """
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
@@ -25,6 +62,8 @@ def _call(messages: list, max_tokens: int) -> str:
             )
             return response.choices[0].message.content
         except RateLimitError:
+            # On first hit, wait 5 seconds and retry once — covers brief
+            # token-bucket exhaustion without failing the whole pipeline.
             if attempt == 0:
                 time.sleep(5)
                 continue
@@ -39,13 +78,18 @@ def _call(messages: list, max_tokens: int) -> str:
 
 def _parse_json(raw: str, step: str) -> dict:
     """
-    Parse JSON from LLM output.
-    Handles markdown code fences and stray text before/after the object.
+    Safely extracts a JSON object from raw LLM output.
+
+    LLMs sometimes wrap JSON in markdown fences (```json ... ```) or add
+    a brief explanation before/after the object. This function strips those
+    artifacts and extracts only the outermost { ... } block, making the
+    parser resilient to common formatting quirks without needing a strict
+    output parser library.
     """
-    # Strip markdown fences
+    # Remove markdown code fences that some LLM responses include
     text = re.sub(r"```(?:json)?", "", raw).strip()
 
-    # Extract the outermost { ... }
+    # Find the outermost JSON object boundaries
     start = text.find("{")
     end   = text.rfind("}")
     if start == -1 or end == -1:
@@ -60,11 +104,22 @@ def _parse_json(raw: str, step: str) -> dict:
         )
 
 
-# ─────────────────────────────────────────
-# PROMPT 1: Analyze the JD
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1: Analyze the Job Description
+# ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_jd(jd_text: str) -> dict:
+    """
+    Extracts structured intelligence from a raw job description.
+
+    Returns a dict with: role_type, must_have_skills, good_to_have_skills,
+    key_keywords, domain, responsibilities, company_tone, emphasis, and
+    projects_to_highlight (which of the candidate's projects best match this JD).
+
+    This output feeds directly into tailor_resume() as context — giving the
+    resume rewriter a clear picture of what the JD actually values before
+    touching a single word of the resume.
+    """
     prompt = f"""You are an expert technical recruiter analyzing a job description for an AI/ML internship role.
 
 Analyze this JD carefully and extract the following. Be precise and technical.
@@ -100,11 +155,27 @@ Return ONLY the JSON. No explanation, no markdown, no backticks."""
     return _parse_json(raw, "Analyze JD")
 
 
-# ─────────────────────────────────────────
-# PROMPT 2: Tailor the Resume Content
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2: Tailor the Resume Content
+# ─────────────────────────────────────────────────────────────────────────────
 
 def tailor_resume(jd_analysis: dict, resume_data: dict = None) -> dict:
+    """
+    Rewrites specific resume sections to better match the analyzed JD.
+
+    Rules enforced via prompt:
+      - Never fabricate skills, projects, or experience that don't exist
+      - Only rephrase, reorder, and emphasize — facts stay accurate
+      - Use JD keywords naturally (not keyword-stuffed)
+      - Reorder projects so the most JD-relevant ones appear first
+      - Adjust tone: punchy for startups, structured for enterprise
+
+    The optional resume_data param allows future use with user-uploaded resumes
+    instead of the hardcoded resume_data.py dict.
+
+    Returns: tailored_summary, skills_to_highlight, projects (reordered +
+    rewritten bullets), skills_to_add_if_familiar, and a cover_note.
+    """
     source = resume_data if resume_data is not None else resume
 
     prompt = f"""You are an expert resume writer helping an AI/ML student tailor their resume for a specific internship role.
@@ -160,11 +231,27 @@ Return ONLY the JSON. No explanation, no markdown, no backticks."""
     return _parse_json(raw, "Tailor Resume")
 
 
-# ─────────────────────────────────────────
-# PROMPT 3: ATS Score Check
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3: ATS Score Check
+# ─────────────────────────────────────────────────────────────────────────────
 
 def ats_score(jd_text: str, tailored: dict) -> dict:
+    """
+    Simulates an ATS (Applicant Tracking System) scan of the tailored resume.
+
+    Real ATS systems score resumes primarily on keyword presence, skill
+    alignment, and experience relevance. This step mimics that behavior by
+    asking the LLM to compare the tailored resume content directly against
+    the original JD text — giving the candidate a pre-submission quality check.
+
+    Score breakdown:
+      - Keyword coverage  : 0–40 points (most weighted — ATS is keyword-driven)
+      - Skill alignment   : 0–30 points
+      - Experience fit    : 0–30 points
+
+    Also returns keyword_matches, keyword_misses, and a one_line_verdict so
+    the candidate knows at a glance whether to apply, tweak, or skip.
+    """
     prompt = f"""You are an ATS (Applicant Tracking System) simulator.
 
 Score this tailored resume against the JD.

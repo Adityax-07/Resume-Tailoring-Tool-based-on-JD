@@ -1,3 +1,17 @@
+# app.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Streamlit application — UI, sidebar auth, and pipeline orchestration.
+#
+# Responsibilities:
+#   1. Bootstrap the Groq API key from Streamlit secrets into os.environ
+#      so tailor.py (which reads os.environ directly) works on Cloud.
+#   2. Render the full UI: hero section, JD input, pipeline progress bar,
+#      and all result sections (ATS analysis, tailored resume, cover note).
+#   3. Manage Supabase auth state in the sidebar (sign in / sign up / sign out).
+#   4. Save each pipeline run to the user's history and increment the
+#      global usage counter after a successful run.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import streamlit as st
 import os
 import json
@@ -6,24 +20,36 @@ from resume_data import resume
 from pdf_generator import build_pdf
 from supabase_client import get_supabase
 
-# ── Bootstrap GROQ key from Streamlit secrets (needed for Cloud deployment)
+# ── Bootstrap Groq API key into os.environ ────────────────────────────────────
+# tailor.py reads os.environ["GROQ_API_KEY"] at import time via the Groq client.
+# On Streamlit Cloud, env vars aren't set automatically — secrets live in
+# st.secrets. We push the key into os.environ here (before tailor.py is
+# imported inside the pipeline block) so both local and Cloud deployments work
+# with the same code path.
 if "GROQ_API_KEY" not in os.environ:
     try:
         os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
     except Exception:
-        pass
+        pass  # will fail later with a clear error when the pipeline runs
 
 st.set_page_config(page_title="Resume Tailor AI", layout="wide", page_icon="🎯")
 
-# ── Session state
+# ── Session state initialisation ──────────────────────────────────────────────
+# Streamlit reruns the entire script on every user interaction. Session state
+# persists values across reruns within a single browser session.
+# sb_user    : dict with {id, email} of the signed-in user, or None
+# sb_access  : Supabase JWT access token (needed to restore auth on reruns)
+# sb_refresh : Supabase refresh token (used to get a new access token if expired)
 for _k, _v in [("sb_user", None), ("sb_access", None), ("sb_refresh", None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-# ── Supabase client (per-session)
+# ── Supabase client (per-session instance) ────────────────────────────────────
 sb = get_supabase()
 
-# Restore auth session on every rerun so RLS tokens are fresh
+# Restore auth session on every rerun so Supabase Row Level Security (RLS)
+# tokens are valid. Without this, the client would be unauthenticated after
+# the first rerun and all history queries would be rejected by RLS policies.
 if sb and st.session_state["sb_access"]:
     try:
         sb.auth.set_session(
@@ -31,6 +57,7 @@ if sb and st.session_state["sb_access"]:
             st.session_state["sb_refresh"],
         )
     except Exception:
+        # Session expired or invalid — clear auth state and force re-login.
         st.session_state.update({"sb_user": None, "sb_access": None, "sb_refresh": None})
 
 
@@ -396,12 +423,21 @@ textarea:focus {
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+# Small pure functions that generate HTML snippets. Kept separate from the
+# main render flow so each visual element can be reused without duplication.
 # ═══════════════════════════════════════════════════════════════════════════════
+
 def pills(items, cls):
+    """Renders a list of strings as a row of styled pill badges."""
     inner = "".join(f'<span class="pill {cls}">{i}</span>' for i in items)
     return f'<div class="pill-row">{inner}</div>'
 
 def progress_bar(label, value, max_val, gradient):
+    """
+    Renders a labelled progress bar for the ATS score breakdown.
+    Converts raw scores (e.g. 32/40) to a percentage width for the CSS fill.
+    """
     pct = int(value / max_val * 100)
     return f"""
     <div class="prog-wrap">
@@ -412,6 +448,11 @@ def progress_bar(label, value, max_val, gradient):
     </div>"""
 
 def score_colors(score):
+    """
+    Returns a (primary, light, background, glow) colour tuple based on score.
+    Green ≥75, amber ≥50, red below — mirrors how recruiters read ATS scores.
+    Used by both the SVG gauge and the verdict badge to keep colours consistent.
+    """
     if score >= 75:
         return "#10b981", "#34d399", "#0d2e22", "rgba(16,185,129,.35)"
     if score >= 50:
@@ -419,6 +460,12 @@ def score_colors(score):
     return "#ef4444", "#f87171", "#2d0b0b", "rgba(239,68,68,.35)"
 
 def svg_gauge(score):
+    """
+    Renders an animated SVG circular gauge for the ATS score.
+    Uses stroke-dasharray to draw the filled arc proportional to the score —
+    a pure SVG approach that works without any JS charting library.
+    The glow drop-shadow colour is tied to score_colors() for visual consistency.
+    """
     c1, c2, bg, glow = score_colors(score)
     R = 54
     circ = 2 * math.pi * R
@@ -450,7 +497,13 @@ def svg_gauge(score):
     </div>"""
 
 def pipeline_status(step):
-    """step: 1=analyzing, 2=tailoring, 3=scoring, 4=done"""
+    """
+    Renders the 3-step pipeline progress bar shown during processing.
+    step 1 = Analyze JD running, step 2 = Tailor Resume running,
+    step 3 = ATS Score running, step 4 = all done.
+    Each dot is styled done/active/waiting based on the current step,
+    giving the user live feedback as each LLM call completes.
+    """
     labels = ["Analyze JD", "Tailor Resume", "ATS Score"]
     parts = []
     for i, lbl in enumerate(labels, 1):
@@ -471,6 +524,7 @@ def pipeline_status(step):
     return f'<div class="pipeline-bar">{"".join(parts)}</div>'
 
 def section_header(text):
+    """Styled section divider with gradient lines flanking the section title."""
     return f"""
     <div class="sec-hdr">
       <div class="sec-hdr-line"></div>
@@ -481,6 +535,16 @@ def section_header(text):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR — AUTH + HISTORY + COUNTER
+# ─────────────────────────────────────────────────────────────────────────────
+# The sidebar handles all Supabase-powered features:
+#   - Sign in / Sign up (email + password via Supabase Auth)
+#   - Recent history (last 5 pipeline runs for the logged-in user)
+#   - Global usage counter (total resumes tailored across all users)
+#
+# The three states are mutually exclusive:
+#   1. sb is None        → Supabase secrets not configured, show a notice
+#   2. sb_user is None   → not signed in, show Sign In / Sign Up tabs
+#   3. sb_user is set    → signed in, show user info + history
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown(
@@ -494,10 +558,12 @@ with st.sidebar:
     )
 
     if sb is None:
+        # Supabase secrets missing — auth and history are disabled but the
+        # core pipeline still works (Groq key is all that's required).
         st.caption("Auth unavailable — add Supabase secrets to enable.")
 
     elif st.session_state["sb_user"] is None:
-        # ── Sign-in / Sign-up tabs
+        # ── Not signed in: show Sign In / Sign Up tabs ────────────────────────
         st.markdown(
             '<div style="font-size:12px;color:#6b7280;margin-bottom:10px;">'
             'Sign in to save your history.</div>',
@@ -512,6 +578,9 @@ with st.sidebar:
                 if li_email and li_pw:
                     try:
                         res = sb.auth.sign_in_with_password({"email": li_email, "password": li_pw})
+                        # Store minimal user info as a plain dict (not the full
+                        # Supabase user object) — avoids serialization issues
+                        # and keeps only what we actually need downstream.
                         st.session_state["sb_user"]    = {"id": res.user.id, "email": res.user.email}
                         st.session_state["sb_access"]  = res.session.access_token
                         st.session_state["sb_refresh"] = res.session.refresh_token
@@ -527,6 +596,8 @@ with st.sidebar:
             if st.button("Create Account", key="btn_signup", use_container_width=True):
                 if su_email and su_pw:
                     try:
+                        # Supabase sends a confirmation email before the account
+                        # is active — user must verify before they can sign in.
                         sb.auth.sign_up({"email": su_email, "password": su_pw})
                         st.success("Account created! Check your email to confirm, then sign in.")
                     except Exception as e:
@@ -535,7 +606,7 @@ with st.sidebar:
                     st.warning("Fill in all fields.")
 
     else:
-        # ── Logged-in: user info + sign out
+        # ── Signed in: show user info, sign out, and history ─────────────────
         user = st.session_state["sb_user"]
         st.markdown(
             f'<div style="font-size:11px;color:#6b7280;margin-bottom:2px;">Signed in as</div>'
@@ -543,17 +614,24 @@ with st.sidebar:
             f'word-break:break-all;margin-bottom:12px;">{user["email"]}</div>',
             unsafe_allow_html=True,
         )
+        # .sb-signout wraps the button in a CSS class that overrides the default
+        # indigo button style to a red/rose variant for destructive actions.
         st.markdown('<div class="sb-signout">', unsafe_allow_html=True)
         if st.button("Sign Out", key="btn_signout", use_container_width=True):
             try:
                 sb.auth.sign_out()
             except Exception:
                 pass
+            # Clear all auth state from session — the next rerun will show the
+            # sign-in form and the Supabase client will be unauthenticated.
             st.session_state.update({"sb_user": None, "sb_access": None, "sb_refresh": None})
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── History
+        # ── Per-user history ──────────────────────────────────────────────────
+        # Fetches the 5 most recent runs for this user from the Supabase
+        # `history` table. RLS policies on the table ensure users can only
+        # query their own rows — the filter by user_id is an extra safeguard.
         st.markdown(
             '<div style="height:1px;background:rgba(255,255,255,.06);margin:16px 0;"></div>',
             unsafe_allow_html=True,
@@ -574,6 +652,8 @@ with st.sidebar:
             )
             if hist.data:
                 for h in hist.data:
+                    # Show role type + ATS score as the expander label so the
+                    # user can identify runs at a glance without expanding.
                     label = f"{h['role_type']}  ·  {h['ats_score']}/100"
                     with st.expander(label):
                         st.caption((h["jd_snippet"] or "")[:140] + "…")
@@ -582,7 +662,9 @@ with st.sidebar:
         except Exception:
             st.caption("History unavailable.")
 
-    # ── Usage counter — always visible
+    # ── Global usage counter — always visible regardless of auth state ────────
+    # Reads from the `usage_counter` table (single row with id=1).
+    # Displayed at the bottom of the sidebar as a social proof metric.
     st.markdown(
         '<div style="height:1px;background:rgba(255,255,255,.06);margin:20px 0 14px;"></div>',
         unsafe_allow_html=True,
@@ -663,37 +745,54 @@ if run:
     if not jd_input.strip():
         st.error("Please paste a job description first.")
     else:
+        # Import lazily so the Groq client isn't instantiated until the button
+        # is clicked — by that point, os.environ["GROQ_API_KEY"] is guaranteed
+        # to be set by the bootstrap block at the top of this file.
         from tailor import analyze_jd, tailor_resume, ats_score, PipelineError
 
+        # st.empty() gives us a single placeholder we can overwrite on each
+        # step to update the pipeline progress bar in-place rather than
+        # appending a new bar below the previous one.
         ph = st.empty()
 
         try:
+            # Step 1: Extract structured data from the JD
             ph.markdown(pipeline_status(1), unsafe_allow_html=True)
             jd_analysis = analyze_jd(jd_input)
 
+            # Step 2: Rewrite resume sections to match the JD
             ph.markdown(pipeline_status(2), unsafe_allow_html=True)
             tailored = tailor_resume(jd_analysis)
 
+            # Step 3: Score the tailored resume against the JD
             ph.markdown(pipeline_status(3), unsafe_allow_html=True)
             ats = ats_score(jd_input, tailored)
 
+            # All steps done — show the completed bar
             ph.markdown(pipeline_status(4), unsafe_allow_html=True)
 
         except PipelineError as e:
+            # PipelineError carries a clean user-facing message from tailor.py.
+            # Clear the progress bar so the error replaces it cleanly.
             ph.empty()
             st.error(str(e))
             st.stop()
 
+        # Bundle all three results into one dict for JSON download and history storage.
         result    = {"jd_analysis": jd_analysis, "tailored_resume": tailored, "ats_score": ats}
         score_val = ats["ats_score"]
         c1, _, vbg, _  = score_colors(score_val)
 
-        # ── Save to history (if logged in)
+        # ── Save run to per-user history ──────────────────────────────────────
+        # Only runs if the user is signed in. Failures are silently swallowed —
+        # a history write failure should never block the user from seeing results.
+        # The full_result JSONB column stores everything so users can revisit
+        # past runs in detail from the history panel.
         if sb and st.session_state["sb_user"]:
             try:
                 sb.table("history").insert({
                     "user_id":    st.session_state["sb_user"]["id"],
-                    "jd_snippet": jd_input[:200],
+                    "jd_snippet": jd_input[:200],       # first 200 chars as preview
                     "role_type":  jd_analysis.get("role_type", "Unknown"),
                     "ats_score":  score_val,
                     "full_result": result,
@@ -701,7 +800,10 @@ if run:
             except Exception:
                 pass  # non-critical — don't surface to user
 
-        # ── Increment global usage counter
+        # ── Increment global usage counter ────────────────────────────────────
+        # Calls a SECURITY DEFINER SQL function (increment_usage) that atomically
+        # increments the single row in usage_counter. SECURITY DEFINER bypasses
+        # RLS so even anonymous users contribute to the count. Silent on failure.
         if sb:
             try:
                 sb.rpc("increment_usage").execute()
